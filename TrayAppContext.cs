@@ -24,6 +24,13 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly ToolStripSeparator _searchSeparator = new();
     private System.Windows.Forms.Timer? _hoverScrollTimer;
 
+    // ToolStripDropDownMenu の内部スクロールAPI(ホバースクロールと先頭復帰で使う)
+    private MethodInfo? _scrollMethod;
+    private MethodInfo? _updateScrollStatusMethod;
+    private ToolStripItem? _upScrollButton;
+
+    private readonly ImeCompositionWatcher _imeWatcher = new();
+
     // 検索ボックスをプログラムから書き換えるときに TextChanged による再構築を止めるためのフラグ。
     private bool _suppressSearchUpdate;
 
@@ -97,23 +104,23 @@ public sealed class TrayAppContext : ApplicationContext
     private void HookHoverScroll()
     {
         var menuType = typeof(ToolStripDropDownMenu);
-        var scrollMethod = menuType.GetMethod("ScrollInternal", BindingFlags.Instance | BindingFlags.NonPublic,
+        _scrollMethod = menuType.GetMethod("ScrollInternal", BindingFlags.Instance | BindingFlags.NonPublic,
             binder: null, types: [typeof(bool)], modifiers: null);
-        var updateStatusMethod = menuType.GetMethod("UpdateScrollButtonStatus", BindingFlags.Instance | BindingFlags.NonPublic);
-        if (scrollMethod is null || updateStatusMethod is null)
+        _updateScrollStatusMethod = menuType.GetMethod("UpdateScrollButtonStatus", BindingFlags.Instance | BindingFlags.NonPublic);
+        if (_scrollMethod is null || _updateScrollStatusMethod is null)
         {
             return;
         }
 
-        HookScrollButton(menuType.GetProperty("UpScrollButton", BindingFlags.Instance | BindingFlags.NonPublic), scrollMethod, updateStatusMethod, up: true);
-        HookScrollButton(menuType.GetProperty("DownScrollButton", BindingFlags.Instance | BindingFlags.NonPublic), scrollMethod, updateStatusMethod, up: false);
+        _upScrollButton = HookScrollButton(menuType.GetProperty("UpScrollButton", BindingFlags.Instance | BindingFlags.NonPublic), _scrollMethod, _updateScrollStatusMethod, up: true);
+        HookScrollButton(menuType.GetProperty("DownScrollButton", BindingFlags.Instance | BindingFlags.NonPublic), _scrollMethod, _updateScrollStatusMethod, up: false);
     }
 
-    private void HookScrollButton(PropertyInfo? property, MethodInfo scrollMethod, MethodInfo updateStatusMethod, bool up)
+    private ToolStripItem? HookScrollButton(PropertyInfo? property, MethodInfo scrollMethod, MethodInfo updateStatusMethod, bool up)
     {
         if (property?.GetValue(_menu) is not ToolStripItem button)
         {
-            return;
+            return null;
         }
 
         button.MouseEnter += (_, _) =>
@@ -148,6 +155,33 @@ public sealed class TrayAppContext : ApplicationContext
             _hoverScrollTimer.Start();
         };
         button.MouseLeave += (_, _) => StopHoverScroll();
+
+        return button;
+    }
+
+    // 一覧を下へスクロールしたままだと、先頭にある検索ボックスが見えなくなる。
+    // 入力中の文字を確認できるように先頭まで戻す。
+    private void ScrollMenuToTop()
+    {
+        if (_scrollMethod is null || _updateScrollStatusMethod is null || _upScrollButton is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // 1回の呼び出しでは少ししか動かないので、上端(ボタンが無効になる)まで繰り返す。
+            _updateScrollStatusMethod.Invoke(_menu, null);
+            for (int i = 0; i < 1000 && _upScrollButton.Enabled; i++)
+            {
+                _scrollMethod.Invoke(_menu, [true]);
+                _updateScrollStatusMethod.Invoke(_menu, null);
+            }
+        }
+        catch
+        {
+            // 内部APIに頼っているため、失敗してもスクロール位置が変わらないだけで済ませる。
+        }
     }
 
     private void StopHoverScroll()
@@ -247,6 +281,20 @@ public sealed class TrayAppContext : ApplicationContext
         };
 
         box.TextBox.PlaceholderText = "絞り込み...";
+
+        // 日本語入力の変換中は TextChanged が起きないため一覧が絞り込まれず、
+        // 下へスクロールした状態だと検索ボックスが画面外に隠れたままになる。
+        // (英数字入力なら1文字ごとに一覧が作り直されて先頭に戻るので問題にならない)
+        // IME の変換開始を捕まえて先頭までスクロールし、入力中の文字が見えるようにする。
+        _imeWatcher.CompositionChanged += ScrollMenuToTop;
+        box.TextBox.HandleCreated += (sender, _) =>
+        {
+            if (_imeWatcher.Handle == IntPtr.Zero && sender is Control control)
+            {
+                _imeWatcher.AssignHandle(control.Handle);
+            }
+        };
+        box.TextBox.HandleDestroyed += (_, _) => _imeWatcher.ReleaseHandle();
         box.TextChanged += (_, _) =>
         {
             if (_suppressSearchUpdate)
@@ -599,6 +647,30 @@ public sealed class TrayAppContext : ApplicationContext
         {
             MessageBox.Show($"開けませんでした:\n{path}\n\n{ex.Message}", "DesktopQuickAccess",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    /// <summary>
+    /// 検索ボックスのウィンドウをサブクラス化して、IME の変換中かどうかを知るためのもの。
+    /// WinForms のイベントだけでは変換中の入力を捕まえられないため、ウィンドウメッセージを直接見る。
+    /// </summary>
+    private sealed class ImeCompositionWatcher : NativeWindow
+    {
+        private const int WM_IME_STARTCOMPOSITION = 0x010D;
+        private const int WM_IME_COMPOSITION = 0x010F;
+
+        public event Action? CompositionChanged;
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+
+            // スクロールでテキストボックスを動かすことになるので、
+            // IME 側の処理(変換ウィンドウの配置など)が済んでから通知する。
+            if (m.Msg is WM_IME_STARTCOMPOSITION or WM_IME_COMPOSITION)
+            {
+                CompositionChanged?.Invoke();
+            }
         }
     }
 
