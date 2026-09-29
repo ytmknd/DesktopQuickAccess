@@ -31,6 +31,10 @@ public sealed class TrayAppContext : ApplicationContext
 
     private readonly ImeCompositionWatcher _imeWatcher = new();
 
+    // 入力中にホバースクロールを止めたときのマウス位置。
+    // マウスが実際に動くまでは自動スクロールを再開しない。
+    private Point _hoverScrollSuspendedAt = new(int.MinValue, int.MinValue);
+
     // 検索ボックスをプログラムから書き換えるときに TextChanged による再構築を止めるためのフラグ。
     private bool _suppressSearchUpdate;
 
@@ -126,6 +130,14 @@ public sealed class TrayAppContext : ApplicationContext
         button.MouseEnter += (_, _) =>
         {
             StopHoverScroll();
+
+            // 入力で一覧が動いた結果カーソルの下にボタンが来ただけの場合は、
+            // 自動スクロールを再開しない(再開すると検索ボックスがまた流れてしまう)。
+            if (Cursor.Position == _hoverScrollSuspendedAt)
+            {
+                return;
+            }
+
             _hoverScrollTimer = new System.Windows.Forms.Timer { Interval = 80 };
             _hoverScrollTimer.Tick += (_, _) =>
             {
@@ -182,6 +194,14 @@ public sealed class TrayAppContext : ApplicationContext
         {
             // 内部APIに頼っているため、失敗してもスクロール位置が変わらないだけで済ませる。
         }
+    }
+
+    // 検索ボックスに入力している間は自動スクロールを止める。
+    // カーソルを下矢印に乗せたまま入力すると、先頭に戻してもすぐ下へ流されてしまうため。
+    private void SuspendHoverScroll()
+    {
+        StopHoverScroll();
+        _hoverScrollSuspendedAt = Cursor.Position;
     }
 
     private void StopHoverScroll()
@@ -286,7 +306,7 @@ public sealed class TrayAppContext : ApplicationContext
         // 下へスクロールした状態だと検索ボックスが画面外に隠れたままになる。
         // (英数字入力なら1文字ごとに一覧が作り直されて先頭に戻るので問題にならない)
         // IME の変換開始を捕まえて先頭までスクロールし、入力中の文字が見えるようにする。
-        _imeWatcher.CompositionChanged += ScrollMenuToTop;
+        _imeWatcher.CompositionChanged += OnImeComposition;
         box.TextBox.HandleCreated += (sender, _) =>
         {
             if (_imeWatcher.Handle == IntPtr.Zero && sender is Control control)
@@ -302,10 +322,17 @@ public sealed class TrayAppContext : ApplicationContext
                 return;
             }
 
+            SuspendHoverScroll();
             RebuildMenu();
         };
 
         return box;
+    }
+
+    private void OnImeComposition()
+    {
+        SuspendHoverScroll();
+        ScrollMenuToTop();
     }
 
     private void ClearSearch()
@@ -326,6 +353,8 @@ public sealed class TrayAppContext : ApplicationContext
     {
         // タスクバーに沿って上向きに開いた場合、絞り込みで高さが変わっても
         // 下端が動かないようにしたいので、開いた時点の位置を覚えておく。
+        _hoverScrollSuspendedAt = new Point(int.MinValue, int.MinValue);
+
         var workingArea = Screen.GetWorkingArea(_menu.Bounds);
         _keepBottomFixed = _menu.Bottom >= workingArea.Bottom - AnchorTolerance;
         _anchorBottom = _menu.Bottom;
@@ -460,6 +489,10 @@ public sealed class TrayAppContext : ApplicationContext
         }
 
         RefreshMenuLayout();
+
+        // 絞り込んでも一覧がスクロールするほど長い場合があるので、
+        // 検索ボックスが必ず見えるように先頭へ戻す。
+        ScrollMenuToTop();
     }
 
     // 表示中に項目数が変わるとAutoSizeにより高さが変わる。
