@@ -10,6 +10,13 @@ open items straight from your Desktop folder without opening File Explorer.
 - **Left-click** the tray icon to pop up a menu listing everything on your
   Desktop. Folders expand into submenus (lazily loaded, always reflecting the
   current contents); clicking a file opens it with its default application.
+- **Incremental search box** at the top of that menu: just start typing and
+  the list narrows as you type (the box is focused the moment the menu opens).
+  Matching ignores the differences Japanese filenames tend to vary in —
+  hiragana vs. katakana, full-width vs. half-width, upper vs. lower case — so
+  `かいぎ`, `カイギ` and `ｶｲｷﾞ` all find the same file, and IME input works.
+  Space-separated words are ANDed. `Enter` opens the top hit, `Down`/`Tab`
+  moves into the list, `Esc` clears the box.
 - **Right-click** the tray icon for the app menu: open the Desktop folder,
   toggle "launch at Windows sign-in", and exit.
 - Hovering over the scroll arrows at the top/bottom of a long menu
@@ -39,6 +46,7 @@ DesktopQuickAccess.csproj    Project file (net10.0-windows, WinForms)
 Program.cs                   Entry point, single-instance guard
 TrayAppContext.cs            Tray icon, menus, hover-scroll, autostart wiring
 ShellIcon.cs                 Shell icon retrieval + caching (SHGetFileInfo)
+SearchFilter.cs              Incremental search: kana/width/case folding + matching
 StartupManager.cs            "Run at sign-in" toggle (HKCU Run key)
 Assets/app.ico               Application / tray icon
 installer/DesktopQuickAccess.iss   Inno Setup script

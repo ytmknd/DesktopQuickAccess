@@ -13,19 +13,40 @@ public sealed class TrayAppContext : ApplicationContext
 {
     private const int MaxItemsPerFolder = 300;
 
+    // 絞り込み中に下端(タスクバー側)を固定するかどうかを判定するときの許容誤差。
+    private const int AnchorTolerance = 8;
+
     private readonly string _desktopPath;
     private readonly NotifyIcon _notifyIcon;
     private readonly ContextMenuStrip _menu;
     private readonly ContextMenuStrip _managementMenu;
+    private readonly ToolStripTextBox _searchBox;
+    private readonly ToolStripSeparator _searchSeparator = new();
     private System.Windows.Forms.Timer? _hoverScrollTimer;
+
+    // 検索ボックスをプログラムから書き換えるときに TextChanged による再構築を止めるためのフラグ。
+    private bool _suppressSearchUpdate;
+
+    // 絞り込み中に Enter で開く対象(先頭の候補)。
+    private (string Path, bool IsDirectory)? _topMatch;
+
+    private bool _keepBottomFixed;
+    private int _anchorBottom;
 
     public TrayAppContext()
     {
         _desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
 
+        _searchBox = CreateSearchBox();
+
         // 左クリック: デスクトップの中身を表示するメニュー
         _menu = new ContextMenuStrip();
-        _menu.Opening += (_, _) => RebuildMenu();
+        _menu.Opening += (_, _) =>
+        {
+            ClearSearch();
+            RebuildMenu();
+        };
+        _menu.Opened += (_, _) => OnMenuOpened();
 
         // 右クリック: アプリの管理メニュー(スタートアップ登録/終了)
         _managementMenu = new ContextMenuStrip();
@@ -212,11 +233,189 @@ public sealed class TrayAppContext : ApplicationContext
         }
     }
 
+    // ----- 絞り込み検索 -----------------------------------------------------
+
+    private ToolStripTextBox CreateSearchBox()
+    {
+        var box = new ToolStripTextBox
+        {
+            Name = "searchBox",
+            AutoSize = false,
+            Width = 240,
+            BorderStyle = BorderStyle.FixedSingle,
+            ToolTipText = "名前で絞り込む(日本語入力可 / 空白区切りでAND検索)",
+        };
+
+        box.TextBox.PlaceholderText = "絞り込み...";
+        box.TextChanged += (_, _) =>
+        {
+            if (_suppressSearchUpdate)
+            {
+                return;
+            }
+
+            RebuildMenu();
+        };
+        box.KeyDown += SearchBox_KeyDown;
+
+        return box;
+    }
+
+    private void ClearSearch()
+    {
+        // TextChanged 経由の再構築を避ける(直後に呼び出し側が RebuildMenu するため)
+        _suppressSearchUpdate = true;
+        try
+        {
+            _searchBox.Text = string.Empty;
+        }
+        finally
+        {
+            _suppressSearchUpdate = false;
+        }
+    }
+
+    private void OnMenuOpened()
+    {
+        // タスクバーに沿って上向きに開いた場合、絞り込みで高さが変わっても
+        // 下端が動かないようにしたいので、開いた時点の位置を覚えておく。
+        var workingArea = Screen.GetWorkingArea(_menu.Bounds);
+        _keepBottomFixed = _menu.Bottom >= workingArea.Bottom - AnchorTolerance;
+        _anchorBottom = _menu.Bottom;
+
+        // 開いた直後からそのまま打ち込めるように、検索ボックスへフォーカスを移す。
+        _menu.BeginInvoke(() => _searchBox.TextBox.Focus());
+    }
+
+    // IME で変換中の Enter / Esc は IME 側が消費するためこのハンドラには届かない。
+    // つまり日本語入力の確定・取り消し操作を邪魔しない。
+    private void SearchBox_KeyDown(object? sender, KeyEventArgs e)
+    {
+        switch (e.KeyCode)
+        {
+            case Keys.Enter:
+                e.SuppressKeyPress = true;
+                e.Handled = true;
+                if (_topMatch is not null)
+                {
+                    OpenTopMatch();
+                }
+                else
+                {
+                    SelectFirstResult();
+                }
+                break;
+
+            case Keys.Escape:
+                // 絞り込み中は入力のクリアだけ行い、空ならそのままメニューを閉じる。
+                if (_searchBox.TextBox.TextLength > 0)
+                {
+                    e.SuppressKeyPress = true;
+                    e.Handled = true;
+                    _searchBox.Text = string.Empty;
+                }
+                break;
+
+            case Keys.Down:
+            case Keys.Tab:
+                if (SelectFirstResult())
+                {
+                    e.SuppressKeyPress = true;
+                    e.Handled = true;
+                }
+                break;
+        }
+    }
+
+    // 検索ボックスから下矢印/Tabで一覧に移動するため、最初の選択可能な項目を選ぶ。
+    private bool SelectFirstResult()
+    {
+        foreach (ToolStripItem item in _menu.Items)
+        {
+            if (item == _searchBox || item == _searchSeparator || !item.Enabled || !item.Available)
+            {
+                continue;
+            }
+
+            item.Select();
+            return true;
+        }
+
+        return false;
+    }
+
+    private void OpenTopMatch()
+    {
+        if (_topMatch is not { } match)
+        {
+            return;
+        }
+
+        _menu.Close(ToolStripDropDownCloseReason.ItemClicked);
+
+        if (match.IsDirectory)
+        {
+            OpenInExplorer(match.Path);
+        }
+        else
+        {
+            LaunchFile(match.Path);
+        }
+    }
+
+    // ----- メニュー構築 -----------------------------------------------------
+
     private void RebuildMenu()
     {
-        DisposeItems(_menu.Items);
+        if (_menu.Items.Count == 0)
+        {
+            _menu.Items.Add(_searchBox);
+            _menu.Items.Add(_searchSeparator);
+        }
 
-        PopulateItems(_menu.Items, _desktopPath);
+        // 検索ボックスはフォーカスを保ったまま使い回す必要があるため、
+        // コレクション全体をクリアせずに結果部分(先頭2項目より後ろ)だけを差し替える。
+        var stale = new List<ToolStripItem>();
+        for (int i = _menu.Items.Count - 1; i >= 2; i--)
+        {
+            stale.Add(_menu.Items[i]);
+            _menu.Items.RemoveAt(i);
+        }
+
+        _topMatch = null;
+        _menu.SuspendLayout();
+        try
+        {
+            PopulateItems(_menu.Items, _desktopPath, filter: SearchQuery.Create(_searchBox.Text));
+        }
+        finally
+        {
+            _menu.ResumeLayout(performLayout: true);
+        }
+
+        foreach (var item in stale)
+        {
+            item.Dispose();
+        }
+
+        RefreshMenuLayout();
+    }
+
+    // 表示中に項目数が変わるとAutoSizeにより高さが変わる。
+    // 上向きに開いているときは下端が動かないよう位置を補正する。
+    private void RefreshMenuLayout()
+    {
+        if (!_menu.Visible || !_keepBottomFixed)
+        {
+            return;
+        }
+
+        _menu.PerformLayout();
+
+        if (_menu.Bottom != _anchorBottom)
+        {
+            _menu.Top = _anchorBottom - _menu.Height;
+        }
     }
 
     private void RebuildManagementMenu()
@@ -250,7 +449,12 @@ public sealed class TrayAppContext : ApplicationContext
         _managementMenu.Items.Add(new ToolStripMenuItem("終了", null, (_, _) => ExitApp()));
     }
 
-    private void PopulateItems(ToolStripItemCollection collection, string folderPath, bool addOpenHeader = false)
+    /// <param name="filter">
+    /// null 以外を渡すと名前が一致する項目だけを表示する(先頭一致を部分一致より前に並べる)。
+    /// サブメニューは絞り込みの対象外なので常に null で呼ぶ。
+    /// </param>
+    private void PopulateItems(ToolStripItemCollection collection, string folderPath, bool addOpenHeader = false,
+        SearchQuery? filter = null)
     {
         if (addOpenHeader)
         {
@@ -265,10 +469,8 @@ public sealed class TrayAppContext : ApplicationContext
         IEnumerable<string> files;
         try
         {
-            dirs = Directory.EnumerateDirectories(folderPath)
-                .OrderBy(Path.GetFileName, StringComparer.CurrentCultureIgnoreCase);
-            files = Directory.EnumerateFiles(folderPath)
-                .OrderBy(Path.GetFileName, StringComparer.CurrentCultureIgnoreCase);
+            dirs = OrderForDisplay(Directory.EnumerateDirectories(folderPath), filter);
+            files = OrderForDisplay(Directory.EnumerateFiles(folderPath), filter);
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
         {
@@ -295,6 +497,11 @@ public sealed class TrayAppContext : ApplicationContext
                 PopulateItems(item.DropDownItems, dir, addOpenHeader: true);
             };
             collection.Add(item);
+
+            if (filter is not null)
+            {
+                _topMatch ??= (dir, true);
+            }
         }
 
         foreach (var file in files)
@@ -307,6 +514,11 @@ public sealed class TrayAppContext : ApplicationContext
             };
             item.Click += (_, _) => LaunchFile(file);
             collection.Add(item);
+
+            if (filter is not null)
+            {
+                _topMatch ??= (file, false);
+            }
         }
 
         if (truncated)
@@ -315,8 +527,25 @@ public sealed class TrayAppContext : ApplicationContext
         }
         else if (count == 0)
         {
-            collection.Add(new ToolStripMenuItem("(空です)") { Enabled = false });
+            collection.Add(new ToolStripMenuItem(filter is null ? "(空です)" : "(該当なし)") { Enabled = false });
         }
+    }
+
+    // 絞り込みなしなら名前順、絞り込み中は一致しない項目を落として
+    // 先頭一致→部分一致の順に並べる。
+    private static IEnumerable<string> OrderForDisplay(IEnumerable<string> paths, SearchQuery? filter)
+    {
+        if (filter is null)
+        {
+            return paths.OrderBy(Path.GetFileName, StringComparer.CurrentCultureIgnoreCase);
+        }
+
+        return paths
+            .Select(path => (path, rank: filter.Match(Path.GetFileName(path))))
+            .Where(entry => entry.rank != SearchQuery.NoMatch)
+            .OrderBy(entry => entry.rank)
+            .ThenBy(entry => Path.GetFileName(entry.path), StringComparer.CurrentCultureIgnoreCase)
+            .Select(entry => entry.path);
     }
 
     // Dispose中にコレクションから自身を取り除こうとするため、
