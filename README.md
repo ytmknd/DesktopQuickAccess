@@ -16,7 +16,8 @@ open items straight from your Desktop folder without opening File Explorer.
   hiragana vs. katakana, full-width vs. half-width, upper vs. lower case — so
   `かいぎ`, `カイギ` and `ｶｲｷﾞ` all find the same file, and IME input works.
   Space-separated words are ANDed. `Enter` opens the top hit, `Down`/`Tab`
-  moves into the list, `Esc` clears the box.
+  moves into the list, and `Esc` clears the box the first time and closes the
+  menu once the box is already empty.
 - **Right-click** the tray icon for the app menu: open the Desktop folder,
   toggle "launch at Windows sign-in", and exit.
 - Hovering over the scroll arrows at the top/bottom of a long menu

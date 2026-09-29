@@ -40,7 +40,7 @@ public sealed class TrayAppContext : ApplicationContext
         _searchBox = CreateSearchBox();
 
         // 左クリック: デスクトップの中身を表示するメニュー
-        _menu = new ContextMenuStrip();
+        _menu = new SearchableMenu { CommandKeyHandler = HandleMenuCommandKey };
         _menu.Opening += (_, _) =>
         {
             ClearSearch();
@@ -256,7 +256,6 @@ public sealed class TrayAppContext : ApplicationContext
 
             RebuildMenu();
         };
-        box.KeyDown += SearchBox_KeyDown;
 
         return box;
     }
@@ -287,43 +286,52 @@ public sealed class TrayAppContext : ApplicationContext
         _menu.BeginInvoke(() => _searchBox.TextBox.Focus());
     }
 
-    // IME で変換中の Enter / Esc は IME 側が消費するためこのハンドラには届かない。
-    // つまり日本語入力の確定・取り消し操作を邪魔しない。
-    private void SearchBox_KeyDown(object? sender, KeyEventArgs e)
+    /// <summary>
+    /// 検索ボックスに入力中のキー操作を処理する。true を返すとそのキーは消費される。
+    ///
+    /// ToolStripDropDown は Esc や Enter を ProcessDialogKey で先に消費してしまい、
+    /// テキストボックスの KeyDown まで届かない。ProcessCmdKey は ProcessDialogKey より
+    /// 前に呼ばれるため、<see cref="SearchableMenu"/> 経由でここにフックしている。
+    ///
+    /// IME で変換中の Enter / Esc は IME 側が消費するのでここには届かない。
+    /// つまり日本語入力の確定・取り消し操作を邪魔しない。
+    /// </summary>
+    private bool HandleMenuCommandKey(Keys keyData)
     {
-        switch (e.KeyCode)
+        // 一覧側にフォーカスが移っているときは通常のメニュー操作に任せる。
+        if (!_searchBox.TextBox.Focused)
+        {
+            return false;
+        }
+
+        switch (keyData)
         {
             case Keys.Enter:
-                e.SuppressKeyPress = true;
-                e.Handled = true;
                 if (_topMatch is not null)
                 {
                     OpenTopMatch();
+                    return true;
                 }
-                else
-                {
-                    SelectFirstResult();
-                }
-                break;
+
+                return SelectFirstResult();
 
             case Keys.Escape:
-                // 絞り込み中は入力のクリアだけ行い、空ならそのままメニューを閉じる。
+                // 1回目(入力あり)は入力のクリアだけ。
                 if (_searchBox.TextBox.TextLength > 0)
                 {
-                    e.SuppressKeyPress = true;
-                    e.Handled = true;
                     _searchBox.Text = string.Empty;
+                    return true;
                 }
-                break;
+
+                // 2回目(入力が空)は既定動作に任せてメニューを閉じる。
+                return false;
 
             case Keys.Down:
             case Keys.Tab:
-                if (SelectFirstResult())
-                {
-                    e.SuppressKeyPress = true;
-                    e.Handled = true;
-                }
-                break;
+                return SelectFirstResult();
+
+            default:
+                return false;
         }
     }
 
@@ -338,6 +346,11 @@ public sealed class TrayAppContext : ApplicationContext
             }
 
             item.Select();
+
+            // フォーカスがテキストボックスに残っていると以降の上下キーもここに来てしまい、
+            // 一覧を移動できなくなる。メニュー本体にフォーカスを移して通常の
+            // メニュー操作(上下キー/Enter/Esc)に引き継ぐ。
+            _menu.Focus();
             return true;
         }
 
@@ -587,6 +600,20 @@ public sealed class TrayAppContext : ApplicationContext
             MessageBox.Show($"開けませんでした:\n{path}\n\n{ex.Message}", "DesktopQuickAccess",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+    }
+
+    /// <summary>
+    /// 検索ボックス付きのメニュー。ToolStripDropDown の既定のキー処理より先に
+    /// キーを受け取れるよう ProcessCmdKey をフックできるようにしたもの。
+    /// </summary>
+    private sealed class SearchableMenu : ContextMenuStrip
+    {
+        // デザイナでは使わないメニューなのでシリアル化の対象外にする(WFO1000 の回避)。
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public Func<Keys, bool>? CommandKeyHandler { get; init; }
+
+        protected override bool ProcessCmdKey(ref Message m, Keys keyData)
+            => CommandKeyHandler?.Invoke(keyData) == true || base.ProcessCmdKey(ref m, keyData);
     }
 
     private void ExitApp()
