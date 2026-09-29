@@ -1,5 +1,5 @@
 #define MyAppName "Desktop Quick Access"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "DesktopQuickAccess"
 #define MyAppExeName "DesktopQuickAccess.exe"
 #define MyAppId "{D5727757-F22C-46EF-AAE8-4189EC5647E3}"
